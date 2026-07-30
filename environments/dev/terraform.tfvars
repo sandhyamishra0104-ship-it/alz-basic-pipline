@@ -17,6 +17,13 @@ vnett = {
     rg_name="rgsan"
     location="korea central"
   }
+"vnet2" = {
+    vnet_name="vnetsan02"
+    address_space=["10.0.0.0/16"]
+    rg_name="rgsan"
+    location="korea central"
+  }
+
 }
 subnets = {
   "subnet1" = {
