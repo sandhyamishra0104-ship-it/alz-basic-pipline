@@ -9,6 +9,12 @@ rgs = {
     location ="korea central"
     managed_by = "sandhya"
   }
+
+    rg1000 ={
+    name ="rg-surendra"
+    location ="korea central"
+    managed_by = "surendra"
+  }
 }
 vnett = {
   "vnet1" = {
