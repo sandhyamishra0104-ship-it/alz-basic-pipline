@@ -1,14 +1,163 @@
 trigger:
-- main
+  branches:
+    include:
+      - main
 
 pool:
   name: Default
+  demands:
+    - Agent.Name -equals DESKTOP-S73UA0F
+
+variables:
+  serviceConnection: 'Azure-CloudOps-Connection'
 
 steps:
-- checkout: self
 
-- script: |
-    echo "Azure DevOps Self-Hosted Agent is working"
-    echo "Agent Name: $(Agent.Name)"
-    echo "Machine Name: $(Agent.MachineName)"
-  displayName: 'Test Self-Hosted Agent'
+# 1. Checkout
+- checkout: self
+  displayName: 'Checkout Terraform Code'
+
+# 2. Check Terraform
+- powershell: |
+    terraform version
+  displayName: 'Check Terraform'
+
+# 3. Terraform Format
+- powershell: |
+    terraform fmt -check -recursive
+  displayName: 'Terraform Format Check'
+
+# 4. Install TFLint
+- powershell: |
+    $ErrorActionPreference = "Stop"
+
+    $installDir = "$(Agent.TempDirectory)\tflint"
+    $zip = "$(Agent.TempDirectory)\tflint.zip"
+
+    New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+
+    Invoke-WebRequest `
+      -Uri "https://github.com/terraform-linters/tflint/releases/latest/download/tflint_windows_amd64.zip" `
+      -OutFile $zip
+
+    Expand-Archive -Path $zip -DestinationPath $installDir -Force
+
+    Write-Host "##vso[task.prependpath]$installDir"
+
+    & "$installDir\tflint.exe" --version
+  displayName: 'Install TFLint'
+
+# 5. TFLint
+- powershell: |
+    $ErrorActionPreference = "Stop"
+
+    tflint --init
+    tflint
+  displayName: 'TFLint Azure Scan'
+
+# 6. Install Checkov
+- powershell: |
+    $ErrorActionPreference = "Stop"
+
+    python -m pip install --upgrade pip
+    python -m pip install checkov
+
+    checkov --version
+  displayName: 'Install Checkov'
+
+# 7. Checkov Security Scan
+- powershell: |
+    $ErrorActionPreference = "Stop"
+
+    checkov `
+      --directory "$(System.DefaultWorkingDirectory)" `
+      --framework terraform `
+      --output cli
+  displayName: 'Checkov Security Scan'
+
+# 8. Install Trivy
+- powershell: |
+    $ErrorActionPreference = "Stop"
+
+    $installDir = "$(Agent.TempDirectory)\trivy"
+    $zip = "$(Agent.TempDirectory)\trivy.zip"
+
+    New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+
+    $release = Invoke-RestMethod `
+      -Uri "https://api.github.com/repos/aquasecurity/trivy/releases/latest"
+
+    $asset = $release.assets |
+      Where-Object { $_.name -match "windows-64bit.zip$" } |
+      Select-Object -First 1
+
+    if (-not $asset) {
+      throw "Trivy Windows release not found."
+    }
+
+    Invoke-WebRequest `
+      -Uri $asset.browser_download_url `
+      -OutFile $zip
+
+    Expand-Archive -Path $zip -DestinationPath $installDir -Force
+
+    Write-Host "##vso[task.prependpath]$installDir"
+
+    & "$installDir\trivy.exe" --version
+  displayName: 'Install Trivy'
+
+# 9. Trivy Security Scan
+- powershell: |
+    $ErrorActionPreference = "Stop"
+
+    trivy config `
+      "$(System.DefaultWorkingDirectory)" `
+      --severity HIGH,CRITICAL `
+      --exit-code 1
+  displayName: 'Trivy IaC Security Scan'
+
+# 10. Terraform Init
+- task: AzureCLI@2
+  displayName: 'Terraform Init'
+  inputs:
+    azureSubscription: '$(serviceConnection)'
+    scriptType: 'ps'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      az account show
+
+      $env:ARM_SUBSCRIPTION_ID = az account show --query id -o tsv
+      $env:ARM_TENANT_ID = az account show --query tenantId -o tsv
+
+      terraform init
+
+# 11. Terraform Validate
+- task: AzureCLI@2
+  displayName: 'Terraform Validate'
+  inputs:
+    azureSubscription: '$(serviceConnection)'
+    scriptType: 'ps'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      terraform validate
+
+# 12. Terraform Plan
+- task: AzureCLI@2
+  displayName: 'Terraform Plan'
+  inputs:
+    azureSubscription: '$(serviceConnection)'
+    scriptType: 'ps'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      $env:ARM_SUBSCRIPTION_ID = az account show --query id -o tsv
+      $env:ARM_TENANT_ID = az account show --query tenantId -o tsv
+
+      terraform plan -out=tfplan
+
+# 13. Publish Plan
+- task: PublishPipelineArtifact@1
+  displayName: 'Publish Terraform Plan'
+  inputs:
+    targetPath: '$(System.DefaultWorkingDirectory)\tfplan'
+    artifact: 'terraform-plan'
+    publishLocation: 'pipeline'
