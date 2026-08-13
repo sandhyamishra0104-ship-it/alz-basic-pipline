@@ -1,0 +1,14 @@
+trigger:
+- main
+
+pool:
+  name: Default
+
+steps:
+- checkout: self
+
+- script: |
+    echo "Azure DevOps Self-Hosted Agent is working"
+    echo "Agent Name: $(Agent.Name)"
+    echo "Machine Name: $(Agent.MachineName)"
+  displayName: 'Test Self-Hosted Agent'
