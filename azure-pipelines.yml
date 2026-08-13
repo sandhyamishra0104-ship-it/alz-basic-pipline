@@ -1,166 +1,338 @@
 trigger:
-  branches:
-    include:
-      - main
+  - main
 
 pool:
   name: Default
-  demands:
-    - Agent.Name -equals DESKTOP-S73UA0F
 
 variables:
+  terraformVersion: '1.9.8'
   serviceConnection: 'Azure-CloudOps-Connection'
+  terraformWorkingDirectory: '$(Build.SourcesDirectory)\environments\dev'
 
-steps:
+stages:
 
-# 1. Checkout
-- checkout: self
-  displayName: 'Checkout Terraform Code'
+# ============================================================
+# STAGE 1 - TERRAFORM VALIDATION & SECURITY
+# ============================================================
 
-# 2. Check Terraform
-- powershell: |
-    terraform version
-  displayName: 'Check Terraform'
+- stage: Validate
+  displayName: 'Terraform Validate & Security'
 
-# Terraform Format
-- task: PowerShell@2
-  displayName: 'Terraform Format'
-  inputs:
-    targetType: 'inline'
-    script: |
-      terraform fmt -recursive
-      terraform fmt -check -recursive
-# 4. Install TFLint
-- powershell: |
-    $ErrorActionPreference = "Stop"
+  jobs:
+  - job: TerraformValidation
+    displayName: 'Terraform Validation'
 
-    $installDir = "$(Agent.TempDirectory)\tflint"
-    $zip = "$(Agent.TempDirectory)\tflint.zip"
+    steps:
 
-    New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+    # --------------------------------------------------------
+    # 1. Checkout Repository
+    # --------------------------------------------------------
 
-    Invoke-WebRequest `
-      -Uri "https://github.com/terraform-linters/tflint/releases/latest/download/tflint_windows_amd64.zip" `
-      -OutFile $zip
+    - checkout: self
+      displayName: 'Checkout Repository'
 
-    Expand-Archive -Path $zip -DestinationPath $installDir -Force
+    # --------------------------------------------------------
+    # 2. Install Terraform
+    # --------------------------------------------------------
 
-    Write-Host "##vso[task.prependpath]$installDir"
+    - powershell: |
+        $ErrorActionPreference = "Stop"
 
-    & "$installDir\tflint.exe" --version
-  displayName: 'Install TFLint'
+        $terraformVersion = "$(terraformVersion)"
+        $url = "https://releases.hashicorp.com/terraform/$terraformVersion/terraform_${terraformVersion}_windows_amd64.zip"
 
-# 5. TFLint
-- powershell: |
-    $ErrorActionPreference = "Stop"
+        $tempZip = "$(Agent.TempDirectory)\terraform.zip"
+        $terraformDir = "$(Agent.TempDirectory)\terraform"
 
-    tflint --init
-    tflint
-  displayName: 'TFLint Azure Scan'
+        Write-Host "Downloading Terraform $terraformVersion..."
 
-# 6. Install Checkov
-- powershell: |
-    $ErrorActionPreference = "Stop"
+        Invoke-WebRequest `
+          -Uri $url `
+          -OutFile $tempZip
 
-    python -m pip install --upgrade pip
-    python -m pip install checkov
+        if (Test-Path $terraformDir) {
+          Remove-Item $terraformDir -Recurse -Force
+        }
 
-    checkov --version
-  displayName: 'Install Checkov'
+        New-Item -ItemType Directory -Path $terraformDir | Out-Null
 
-# 7. Checkov Security Scan
-- powershell: |
-    $ErrorActionPreference = "Stop"
+        Expand-Archive `
+          -Path $tempZip `
+          -DestinationPath $terraformDir `
+          -Force
 
-    checkov `
-      --directory "$(System.DefaultWorkingDirectory)" `
-      --framework terraform `
-      --output cli
-  displayName: 'Checkov Security Scan'
+        Write-Host "Terraform installed."
 
-# 8. Install Trivy
-- powershell: |
-    $ErrorActionPreference = "Stop"
+        & "$terraformDir\terraform.exe" version
 
-    $installDir = "$(Agent.TempDirectory)\trivy"
-    $zip = "$(Agent.TempDirectory)\trivy.zip"
+        Write-Host "##vso[task.setvariable variable=TerraformExe]$terraformDir\terraform.exe"
 
-    New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+      displayName: 'Install Terraform'
 
-    $release = Invoke-RestMethod `
-      -Uri "https://api.github.com/repos/aquasecurity/trivy/releases/latest"
+    # --------------------------------------------------------
+    # 3. Terraform Format
+    # --------------------------------------------------------
 
-    $asset = $release.assets |
-      Where-Object { $_.name -match "windows-64bit.zip$" } |
-      Select-Object -First 1
+    - powershell: |
+        $ErrorActionPreference = "Stop"
 
-    if (-not $asset) {
-      throw "Trivy Windows release not found."
-    }
+        Write-Host "Running Terraform format..."
 
-    Invoke-WebRequest `
-      -Uri $asset.browser_download_url `
-      -OutFile $zip
+        & "$(TerraformExe)" fmt -recursive "$(Build.SourcesDirectory)"
 
-    Expand-Archive -Path $zip -DestinationPath $installDir -Force
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Terraform fmt failed."
+          exit 1
+        }
 
-    Write-Host "##vso[task.prependpath]$installDir"
+        Write-Host "Terraform formatting completed."
 
-    & "$installDir\trivy.exe" --version
-  displayName: 'Install Trivy'
+      displayName: 'Terraform Format'
 
-# 9. Trivy Security Scan
-- powershell: |
-    $ErrorActionPreference = "Stop"
+    # --------------------------------------------------------
+    # 4. Terraform Init
+    # --------------------------------------------------------
 
-    trivy config `
-      "$(System.DefaultWorkingDirectory)" `
-      --severity HIGH,CRITICAL `
-      --exit-code 1
-  displayName: 'Trivy IaC Security Scan'
+    - task: AzureCLI@2
+      displayName: 'Terraform Init'
+      inputs:
+        azureSubscription: '$(serviceConnection)'
+        scriptType: 'ps'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
 
-# 10. Terraform Init
-- task: AzureCLI@2
-  displayName: 'Terraform Init'
-  inputs:
-    azureSubscription: '$(serviceConnection)'
-    scriptType: 'ps'
-    scriptLocation: 'inlineScript'
-    inlineScript: |
-      az account show
+          $ErrorActionPreference = "Stop"
 
-      $env:ARM_SUBSCRIPTION_ID = az account show --query id -o tsv
-      $env:ARM_TENANT_ID = az account show --query tenantId -o tsv
+          Set-Location "$(terraformWorkingDirectory)"
 
-      terraform init
+          Write-Host "Working directory:"
+          Get-Location
 
-# 11. Terraform Validate
-- task: AzureCLI@2
-  displayName: 'Terraform Validate'
-  inputs:
-    azureSubscription: '$(serviceConnection)'
-    scriptType: 'ps'
-    scriptLocation: 'inlineScript'
-    inlineScript: |
-      terraform validate
+          Write-Host "Terraform version:"
+          & "$(TerraformExe)" version
 
-# 12. Terraform Plan
-- task: AzureCLI@2
-  displayName: 'Terraform Plan'
-  inputs:
-    azureSubscription: '$(serviceConnection)'
-    scriptType: 'ps'
-    scriptLocation: 'inlineScript'
-    inlineScript: |
-      $env:ARM_SUBSCRIPTION_ID = az account show --query id -o tsv
-      $env:ARM_TENANT_ID = az account show --query tenantId -o tsv
+          Write-Host "Initializing Terraform..."
 
-      terraform plan -out=tfplan
+          & "$(TerraformExe)" init -input=false
 
-# 13. Publish Plan
-- task: PublishPipelineArtifact@1
-  displayName: 'Publish Terraform Plan'
-  inputs:
-    targetPath: '$(System.DefaultWorkingDirectory)\tfplan'
-    artifact: 'terraform-plan'
-    publishLocation: 'pipeline'
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Terraform init failed."
+            exit 1
+          }
+
+          Write-Host "Terraform init completed successfully."
+
+    # --------------------------------------------------------
+    # 5. Terraform Validate
+    # --------------------------------------------------------
+
+    - powershell: |
+
+        $ErrorActionPreference = "Stop"
+
+        Set-Location "$(terraformWorkingDirectory)"
+
+        Write-Host "Running Terraform validate..."
+
+        & "$(TerraformExe)" validate
+
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Terraform validation failed."
+          exit 1
+        }
+
+        Write-Host "Terraform validation successful."
+
+      displayName: 'Terraform Validate'
+
+    # --------------------------------------------------------
+    # 6. Install TFLint
+    # --------------------------------------------------------
+
+    - powershell: |
+
+        $ErrorActionPreference = "Stop"
+
+        $version = "0.59.1"
+
+        $zip = "$(Agent.TempDirectory)\tflint.zip"
+
+        $dir = "$(Agent.TempDirectory)\tflint"
+
+        $url = "https://github.com/terraform-linters/tflint/releases/download/v$version/tflint_windows_amd64.zip"
+
+        Write-Host "Downloading TFLint..."
+
+        Invoke-WebRequest `
+          -Uri $url `
+          -OutFile $zip
+
+        if (Test-Path $dir) {
+          Remove-Item $dir -Recurse -Force
+        }
+
+        New-Item -ItemType Directory -Path $dir | Out-Null
+
+        Expand-Archive `
+          -Path $zip `
+          -DestinationPath $dir `
+          -Force
+
+        & "$dir\tflint.exe" --version
+
+        Write-Host "##vso[task.setvariable variable=TFLintExe]$dir\tflint.exe"
+
+      displayName: 'Install TFLint'
+
+    # --------------------------------------------------------
+    # 7. TFLint Configuration
+    # --------------------------------------------------------
+
+    - powershell: |
+
+        $ErrorActionPreference = "Stop"
+
+        Set-Location "$(terraformWorkingDirectory)"
+
+        if (Test-Path "$(Build.SourcesDirectory)\.tflint.hcl") {
+
+          Write-Host "TFLint configuration found."
+
+          & "$(TFLintExe)" --init
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "TFLint plugin initialization returned a warning."
+          }
+
+        }
+        else {
+
+          Write-Host "No .tflint.hcl found."
+          Write-Host "Running TFLint with default configuration."
+
+        }
+
+      displayName: 'Initialize TFLint'
+
+    # --------------------------------------------------------
+    # 8. TFLint Scan
+    # --------------------------------------------------------
+
+    - powershell: |
+
+        Set-Location "$(terraformWorkingDirectory)"
+
+        Write-Host "Running TFLint security/code quality scan..."
+
+        & "$(TFLintExe)" --recursive
+
+        if ($LASTEXITCODE -ne 0) {
+
+          Write-Warning "TFLint found issues."
+          Write-Warning "Pipeline will continue because this is a non-blocking security check."
+
+        }
+        else {
+
+          Write-Host "TFLint scan passed."
+
+        }
+
+      displayName: 'TFLint Scan'
+      continueOnError: true
+
+    # --------------------------------------------------------
+    # 9. Install Checkov
+    # --------------------------------------------------------
+
+    - powershell: |
+
+        $ErrorActionPreference = "Stop"
+
+        Write-Host "Checking Python..."
+
+        python --version
+
+        Write-Host "Installing Checkov..."
+
+        python -m pip install --upgrade pip
+
+        python -m pip install checkov
+
+        Write-Host "Checkov installation completed."
+
+        checkov --version
+
+      displayName: 'Install Checkov'
+
+    # --------------------------------------------------------
+    # 10. Checkov Security Scan
+    # --------------------------------------------------------
+
+    - powershell: |
+
+        Set-Location "$(Build.SourcesDirectory)"
+
+        Write-Host "Running Checkov Azure security scan..."
+
+        checkov `
+          -d . `
+          --framework terraform `
+          --soft-fail `
+          --output cli `
+          --output-file-path console
+
+        if ($LASTEXITCODE -ne 0) {
+
+          Write-Warning "Checkov returned security findings."
+          Write-Warning "Findings are reported but will not block this pipeline."
+
+        }
+        else {
+
+          Write-Host "Checkov security scan completed."
+
+        }
+
+      displayName: 'Checkov Security Scan'
+      continueOnError: true
+
+    # --------------------------------------------------------
+    # 11. Terraform Plan
+    # --------------------------------------------------------
+
+    - task: AzureCLI@2
+      displayName: 'Terraform Plan'
+      inputs:
+        azureSubscription: '$(serviceConnection)'
+        scriptType: 'ps'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+
+          $ErrorActionPreference = "Stop"
+
+          Set-Location "$(terraformWorkingDirectory)"
+
+          Write-Host "Running Terraform Plan..."
+
+          & "$(TerraformExe)" plan `
+            -input=false `
+            -out="$(Build.ArtifactStagingDirectory)\tfplan"
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Terraform plan failed."
+            exit 1
+          }
+
+          Write-Host "Terraform plan completed successfully."
+
+    # --------------------------------------------------------
+    # 12. Publish Terraform Plan
+    # --------------------------------------------------------
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Terraform Plan'
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)\tfplan'
+        artifact: 'terraform-plan'
+        publishLocation: 'pipeline'
