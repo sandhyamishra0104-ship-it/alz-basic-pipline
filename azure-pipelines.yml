@@ -22,11 +22,14 @@ steps:
     terraform version
   displayName: 'Check Terraform'
 
-# 3. Terraform Format
-- powershell: |
-    terraform fmt -check -recursive
-  displayName: 'Terraform Format Check'
-
+# Terraform Format
+- task: PowerShell@2
+  displayName: 'Terraform Format'
+  inputs:
+    targetType: 'inline'
+    script: |
+      terraform fmt -recursive
+      terraform fmt -check -recursive
 # 4. Install TFLint
 - powershell: |
     $ErrorActionPreference = "Stop"
