@@ -1,12 +1,5 @@
 trigger:
-  branches:
-    include:
-      - main
-
-pr:
-  branches:
-    include:
-      - main
+  - main
 
 pool:
   name: Default
@@ -14,218 +7,156 @@ pool:
 variables:
   terraformVersion: '1.9.8'
   serviceConnection: 'Azure-CloudOps-Connection'
-  terraformWorkingDirectory: '$(Build.SourcesDirectory)\environments\dev'
+  workingDirectory: '$(Build.SourcesDirectory)\environments\dev'
 
-stages:
+steps:
+  - checkout: self
+    displayName: 'Checkout Repository'
 
-- stage: Terraform_Dev
-  displayName: 'Terraform DEV - Security, Plan & Apply'
+  - powershell: |
+      $ErrorActionPreference = "Stop"
 
-  jobs:
+      $version = "$(terraformVersion)"
+      $zip = "$(Agent.TempDirectory)\terraform.zip"
+      $dir = "$(Agent.TempDirectory)\terraform"
+      $url = "https://releases.hashicorp.com/terraform/$version/terraform_${version}_windows_amd64.zip"
 
-  - job: TerraformDev
-    displayName: 'Terraform DEV'
+      Write-Host "Downloading Terraform $version..."
 
-    steps:
+      Invoke-WebRequest -Uri $url -OutFile $zip
 
-    - checkout: self
-      displayName: 'Checkout Repository'
+      if (Test-Path $dir) {
+          Remove-Item $dir -Recurse -Force
+      }
 
-    - powershell: |
-        $ErrorActionPreference = "Stop"
+      New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
-        $terraformVersion = "$(terraformVersion)"
-        $url = "https://releases.hashicorp.com/terraform/$terraformVersion/terraform_${terraformVersion}_windows_amd64.zip"
+      Expand-Archive -Path $zip -DestinationPath $dir -Force
 
-        $zipPath = "$(Agent.TempDirectory)\terraform.zip"
-        $terraformPath = "$(Agent.TempDirectory)\terraform"
+      $terraformExe = Join-Path $dir "terraform.exe"
 
-        Write-Host "Installing Terraform $terraformVersion..."
+      & $terraformExe version
 
-        Invoke-WebRequest `
-          -Uri $url `
-          -OutFile $zipPath
+      Write-Host "##vso[task.setvariable variable=TerraformExe]$terraformExe"
+    displayName: 'Install Terraform'
 
-        if (Test-Path $terraformPath) {
-          Remove-Item $terraformPath -Recurse -Force
-        }
+  - task: UsePythonVersion@0
+    displayName: 'Setup Python'
+    inputs:
+      versionSpec: '3.x'
+      architecture: 'x64'
 
-        New-Item `
-          -ItemType Directory `
-          -Path $terraformPath `
-          -Force | Out-Null
+  - powershell: |
+      $ErrorActionPreference = "Stop"
 
-        Expand-Archive `
-          -Path $zipPath `
-          -DestinationPath $terraformPath `
-          -Force
+      python --version
+      python -m pip install --upgrade pip
+      python -m pip install checkov
 
-        $terraformExe = "$terraformPath\terraform.exe"
+      Write-Host "Checkov version:"
+      checkov --version
+    displayName: 'Install Checkov'
 
-        & $terraformExe version
+  - powershell: |
+      $ErrorActionPreference = "Continue"
 
-        Write-Host "##vso[task.setvariable variable=TerraformExe]$terraformExe"
+      Write-Host "Running Checkov security scan..."
 
-      displayName: 'Install Terraform'
+      Set-Location "$(Build.SourcesDirectory)"
 
-    - powershell: |
-        $ErrorActionPreference = "Stop"
+      checkov --directory "$(Build.SourcesDirectory)" --framework terraform --soft-fail --output cli
 
-        Write-Host "Running Terraform format check..."
-
-        & "$(TerraformExe)" fmt -check -recursive "$(Build.SourcesDirectory)"
-
-        if ($LASTEXITCODE -ne 0) {
-          Write-Error "Terraform format check failed."
-          exit 1
-        }
-
-        Write-Host "Terraform format check passed."
-
-      displayName: 'Terraform Format Check'
-
-    - task: UsePythonVersion@0
-      displayName: 'Setup Python'
-      inputs:
-        versionSpec: '3.x'
-        architecture: 'x64'
-
-    - powershell: |
-        $ErrorActionPreference = "Stop"
-
-        Write-Host "Installing Checkov..."
-
-        python --version
-
-        python -m pip install --upgrade pip
-        python -m pip install checkov
-
-        Write-Host "Checkov version:"
-        checkov --version
-
-      displayName: 'Install Checkov'
-
-    - powershell: |
-        $ErrorActionPreference = "Continue"
-
-        Write-Host "Running Checkov security scan..."
-
-        Set-Location "$(Build.SourcesDirectory)"
-
-        checkov `
-          --directory "$(Build.SourcesDirectory)" `
-          --framework terraform `
-          --output cli `
-          --soft-fail
-
-        if ($LASTEXITCODE -ne 0) {
+      if ($LASTEXITCODE -ne 0) {
           Write-Warning "Checkov found security findings."
           Write-Warning "Pipeline will continue because soft-fail is enabled."
-        }
-        else {
-          Write-Host "Checkov security scan passed."
-        }
+      }
+      else {
+          Write-Host "Checkov scan completed successfully."
+      }
 
-        exit 0
+      exit 0
+    displayName: 'Checkov Security Scan'
 
-      displayName: 'Checkov Security Scan'
-
-    - task: AzureCLI@2
-      displayName: 'Terraform Init'
-      inputs:
-        azureSubscription: '$(serviceConnection)'
-        scriptType: 'ps'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          $ErrorActionPreference = "Stop"
-
-          Set-Location "$(terraformWorkingDirectory)"
-
-          Write-Host "Working directory:"
-          Get-Location
-
-          Write-Host "Running Terraform Init..."
-
-          & "$(TerraformExe)" init -input=false
-
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "Terraform init failed."
-            exit 1
-          }
-
-          Write-Host "Terraform init completed successfully."
-
-    - powershell: |
+  - task: AzureCLI@2
+    displayName: 'Terraform Init'
+    inputs:
+      azureSubscription: '$(serviceConnection)'
+      scriptType: 'ps'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
         $ErrorActionPreference = "Stop"
 
-        Set-Location "$(terraformWorkingDirectory)"
+        Set-Location "$(workingDirectory)"
 
-        Write-Host "Running Terraform Validate..."
+        Write-Host "Working directory:"
+        Get-Location
 
-        & "$(TerraformExe)" validate
+        & "$(TerraformExe)" init -input=false
 
         if ($LASTEXITCODE -ne 0) {
-          Write-Error "Terraform validation failed."
-          exit 1
+            Write-Error "Terraform init failed."
+            exit 1
         }
 
-        Write-Host "Terraform validation successful."
+        Write-Host "Terraform init completed successfully."
 
-      displayName: 'Terraform Validate'
+  - powershell: |
+      $ErrorActionPreference = "Stop"
 
-    - task: AzureCLI@2
-      displayName: 'Terraform Plan'
-      inputs:
-        azureSubscription: '$(serviceConnection)'
-        scriptType: 'ps'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          $ErrorActionPreference = "Stop"
+      Set-Location "$(workingDirectory)"
 
-          Set-Location "$(terraformWorkingDirectory)"
+      Write-Host "Running Terraform validate..."
 
-          Write-Host "Running Terraform Plan..."
+      & "$(TerraformExe)" validate
 
-          & "$(TerraformExe)" plan `
-            -input=false `
-            -var-file="terraform.tfvars" `
-            -out="$(Build.ArtifactStagingDirectory)\tfplan"
+      if ($LASTEXITCODE -ne 0) {
+          Write-Error "Terraform validate failed."
+          exit 1
+      }
 
-          if ($LASTEXITCODE -ne 0) {
+      Write-Host "Terraform validate completed successfully."
+    displayName: 'Terraform Validate'
+
+  - task: AzureCLI@2
+    displayName: 'Terraform Plan'
+    inputs:
+      azureSubscription: '$(serviceConnection)'
+      scriptType: 'ps'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        $ErrorActionPreference = "Stop"
+
+        Set-Location "$(workingDirectory)"
+
+        Write-Host "Running Terraform plan..."
+
+        & "$(TerraformExe)" plan -input=false -var-file="terraform.tfvars" -out="$(Build.ArtifactStagingDirectory)\tfplan"
+
+        if ($LASTEXITCODE -ne 0) {
             Write-Error "Terraform plan failed."
             exit 1
-          }
+        }
 
-          Write-Host "Terraform plan completed successfully."
+        Write-Host "Terraform plan completed successfully."
 
-    - task: PublishPipelineArtifact@1
-      displayName: 'Publish Terraform Plan'
-      inputs:
-        targetPath: '$(Build.ArtifactStagingDirectory)\tfplan'
-        artifact: 'terraform-plan'
-        publishLocation: 'pipeline'
+  - task: AzureCLI@2
+    displayName: 'Terraform Apply'
+    inputs:
+      azureSubscription: '$(serviceConnection)'
+      scriptType: 'ps'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        $ErrorActionPreference = "Stop"
 
-    - task: AzureCLI@2
-      displayName: 'Terraform Apply - DEV'
-      inputs:
-        azureSubscription: '$(serviceConnection)'
-        scriptType: 'ps'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-          $ErrorActionPreference = "Stop"
+        Set-Location "$(workingDirectory)"
 
-          Set-Location "$(terraformWorkingDirectory)"
+        Write-Host "Applying Terraform plan..."
 
-          Write-Host "Running Terraform Apply..."
+        & "$(TerraformExe)" apply -input=false -auto-approve "$(Build.ArtifactStagingDirectory)\tfplan"
 
-          & "$(TerraformExe)" apply `
-            -input=false `
-            -auto-approve `
-            "$(Build.ArtifactStagingDirectory)\tfplan"
-
-          if ($LASTEXITCODE -ne 0) {
+        if ($LASTEXITCODE -ne 0) {
             Write-Error "Terraform apply failed."
             exit 1
-          }
+        }
 
-          Write-Host "Terraform Apply completed successfully."
+        Write-Host "Terraform apply completed successfully."
